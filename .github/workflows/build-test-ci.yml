@@ -18,6 +18,7 @@ jobs:
     steps:
     - name: Install dependencies
       run: |
+        sudo rm -f /etc/apt/sources.list.d/google-chrome.sources /etc/apt/sources.list.d/microsoft-prod.list
         sudo apt-get update -qq
         sudo apt-get install build-essential gcc gcc-multilib clang automake autoconf autoconf-archive libtool pax-utils -qy
 
