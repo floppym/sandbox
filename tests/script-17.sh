@@ -1,6 +1,8 @@
 #!/bin/sh
 # a traced exec that fails must not free the caller's environment
 
+[ "${at_xfail}" = "yes" ] && exit 77 # see script-0
+
 addwrite $PWD
 
 # set*id makes the exec wrapper hand this to the tracer rather than run it
