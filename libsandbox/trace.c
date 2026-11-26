@@ -427,9 +427,12 @@ static bool trace_check_syscall(const struct syscall_entry *se, __u64 args[6])
 
 struct trace_task {
 	pid_t pid;
+	uint8_t signal;
 	bool before_syscall;
 	bool fake_syscall_ret;
 	bool detach;
+	bool listen;
+	bool restart;
 };
 
 static struct trace_task *task_list;
@@ -597,14 +600,125 @@ static void handle_syscall(struct trace_task *tt) {
 	}
 }
 
-static void trace_loop(int mypipe)
+static struct trace_task *get_task_exec()
 {
-	bool before_exec = true;
+	struct trace_task *tt;
+	unsigned long oldpid;
+	if (!do_ptrace(PTRACE_GETEVENTMSG, NULL, &oldpid) && trace_pid != oldpid) {
+		delete_task(trace_pid);
+		tt = get_task(oldpid);
+		tt->pid = trace_pid;
+	} else
+		tt = get_task(trace_pid);
+	return tt;
+}
 
+static void check_status(int status)
+{
+	static bool before_exec = true;
+
+	if (WIFSIGNALED(status)) {
+		int sig = WTERMSIG(status);
+		sb_debug("signaled %s %i", strsig(sig), sig);
+		delete_task(trace_pid);
+		return;
+	} else if (WIFEXITED(status)) {
+		int ec = WEXITSTATUS(status);
+		sb_debug("exited %i", ec);
+		delete_task(trace_pid);
+		return;
+	}
+
+	sb_assert(WIFSTOPPED(status));
+
+	unsigned event = (unsigned)status >> 16;
+	int sig = WSTOPSIG(status);
+	struct trace_task *tt;
+
+	if (event == PTRACE_EVENT_EXEC)
+		tt = get_task_exec();
+	else
+		tt = get_task(trace_pid);
+
+	tt->restart = true;
+
+	switch (event) {
+	case 0:
+		if (sig == (SIGTRAP | 0x80)) {
+			tt->before_syscall = !tt->before_syscall;
+			if (tt->detach)
+				break;
+			if (before_exec)
+				sb_debug("waiting for exec; status: %#x", status);
+			else
+				handle_syscall(tt);
+		} else {
+			/* For whatever signal the child caught, let's ignore it and
+			 * continue on.  If it aborted, segfaulted, whatever, that's
+			 * its problem, not ours, so don't whine about it.  We just
+			 * have to be sure to bubble it back up.  #265072
+			 *
+			 * The next run of this loop should see the WIFSIGNALED status
+			 * and we'll exit then.
+			 */
+			sb_debug("passing signal through %s (%i)", strsig(sig), sig);
+			tt->signal = sig;
+			if (sig == SIGCONT)
+				tt->listen = false;
+		}
+		break;
+
+	case PTRACE_EVENT_EXEC:
+		sb_debug("exec event!");
+
+		if (before_exec) {
+			before_exec = false;
+			/* Detach from any other processes that existed before exec.
+			 * Needed when the parent loses the race after fork.
+			 * parent calls fork()
+			 * child emits PTRACE_EVENT_EXEC
+			 * parent emits PTRACE_EVENT_FORK
+			 */
+			detach_others();
+		} else {
+			/* Avoid tracing a dynamic linked binary */
+			/* TODO: check if new binary is static */
+			tt->detach = true;
+		}
+		break;
+
+	case PTRACE_EVENT_STOP:
+		sb_debug("stop event!");
+		if (sig != SIGTRAP)
+			tt->listen = true;
+		break;
+
+	case PTRACE_EVENT_CLONE:
+	case PTRACE_EVENT_FORK:
+	case PTRACE_EVENT_VFORK:
+		sb_debug("fork event!");
+		if (before_exec) {
+			/* Detach from the parent assuming the child will exec.
+			 * Shortcut when the parent wins the race after fork.
+			 * parent calls fork()
+			 * parent emits PTRACE_EVENT_FORK
+			 * child emits PTRACE_EVENT_EXEC
+			 */
+			tt->detach = true;
+		}
+		break;
+
+	default:
+		sb_ebort("ISE: unhandle ptrace signal %s (%i) event %u\n",
+			 strsig(sig), sig, event);
+	}
+}
+
+static int do_waitpid(int options)
+{
 	for (;;) {
 		int status;
-		/* pid might change when exec occurs in a multi-threaded program */
-		trace_pid = waitpid(-1, &status, 0);
+		trace_pid = waitpid(-1, &status, options);
 		if (trace_pid == -1) {
 			if (errno == EINTR)
 				continue;
@@ -614,125 +728,41 @@ static void trace_loop(int mypipe)
 			}
 			sb_ebort("ISE: waitpid() failed: %s\n", strerror(errno));
 		}
-
-		if (WIFSIGNALED(status)) {
-			int sig = WTERMSIG(status);
-			sb_debug("signaled %s %i", strsig(sig), sig);
-			delete_task(trace_pid);
-			continue;
-		} else if (WIFEXITED(status)) {
-			int ec = WEXITSTATUS(status);
-			sb_debug("exited %i", ec);
-			delete_task(trace_pid);
-			continue;
-		}
-
-		sb_assert(WIFSTOPPED(status));
-
-		unsigned event = (unsigned)status >> 16;
-		int sig = WSTOPSIG(status);
-		void *data = NULL;
-		sb_ptrace_req_t restart = PTRACE_SYSCALL;
-		struct trace_task *tt;
-
-		if (event != PTRACE_EVENT_EXEC)
-			tt = get_task(trace_pid);
-
-		switch (event) {
-		case 0:
-			if (sig == (SIGTRAP | 0x80)) {
-				tt->before_syscall = !tt->before_syscall;
-				if (tt->detach)
-					break;
-				if (before_exec)
-					sb_debug("waiting for exec; status: %#x", status);
-				else
-					handle_syscall(tt);
-			} else {
-				/* For whatever signal the child caught, let's ignore it and
-				 * continue on.  If it aborted, segfaulted, whatever, that's
-				 * its problem, not ours, so don't whine about it.  We just
-				 * have to be sure to bubble it back up.  #265072
-				 *
-				 * The next run of this loop should see the WIFSIGNALED status
-				 * and we'll exit then.
-				 */
-				sb_debug("passing signal through %s (%i)", strsig(sig), sig);
-				data = (void *)(uintptr_t)(sig);
-			}
-			break;
-
-		case PTRACE_EVENT_EXEC:
-			sb_debug("exec event!");
-
-			unsigned long oldpid;
-			if (!do_ptrace(PTRACE_GETEVENTMSG, NULL, &oldpid) && trace_pid != oldpid) {
-				delete_task(trace_pid);
-				tt = get_task(oldpid);
-				tt->pid = trace_pid;
-			} else {
-				tt = get_task(trace_pid);
-			}
-
-			if (tt->detach)
-				break;
-
-			if (before_exec) {
-				before_exec = false;
-				/* Detach from any other processes that existed before exec.
-				 * Needed when the parent loses the race after fork.
-				 * parent calls fork()
-				 * child emits PTRACE_EVENT_EXEC
-				 * parent emits PTRACE_EVENT_FORK
-				 */
-				detach_others();
-			} else {
-				/* Avoid tracing a dynamic linked binary */
-				/* TODO: check if new binary is static */
-				tt->detach = true;
-			}
-			break;
-
-		case PTRACE_EVENT_STOP:
-			sb_debug("stop event!");
-			if (sig != SIGTRAP)
-				restart = PTRACE_LISTEN;
-			break;
-
-		case PTRACE_EVENT_CLONE:
-		case PTRACE_EVENT_FORK:
-		case PTRACE_EVENT_VFORK:
-			sb_debug("fork event!");
-			if (before_exec) {
-				/* Detach from the parent assuming the child will exec.
-				 * Shortcut when the parent wins the race after fork.
-				 * parent calls fork()
-				 * parent emits PTRACE_EVENT_FORK
-				 * child emits PTRACE_EVENT_EXEC
-				 */
-				tt->detach = true;
-			}
-			break;
-
-		default:
-			sb_ebort("ISE: unhandle ptrace signal %s (%i) event %u\n",
-			         strsig(sig), sig, event);
-		}
-
-		if (tt->detach) {
-			sb_debug("detaching");
-			restart = PTRACE_DETACH;
-			clear_task(tt);
-		}
-
-		if (mypipe != -1) {
-			/* tracee blocks until we close this */
-			close(mypipe);
-			mypipe = -1;
-		}
-
-		do_ptrace(restart, NULL, data);
+		return status;
 	}
+}
+
+static void restart_tasks(void)
+{
+	for (size_t i = 0; i < task_list_count; ++i) {
+		struct trace_task *tt = task_list + i;
+
+		if (!tt->restart)
+			continue;
+
+		sb_ptrace_req_t request = tt->detach ? PTRACE_DETACH
+			: tt->listen ? PTRACE_LISTEN : PTRACE_SYSCALL;
+
+		trace_pid = tt->pid;
+		do_ptrace(request, NULL, (void *)(uintptr_t)tt->signal);
+
+		tt->signal = 0;
+		tt->listen = false;
+		tt->restart = false;
+
+		if (tt->detach)
+			clear_task(tt);
+	}
+}
+
+static void trace_loop(void)
+{
+	int status = do_waitpid(0);
+	do {
+		check_status(status);
+		status = do_waitpid(WNOHANG);
+	} while (trace_pid > 0);
+	restart_tasks();
 }
 
 #ifndef HAVE_CLOSEFROM
@@ -873,7 +903,14 @@ void trace_main(void)
 	if (do_ptrace(PTRACE_INTERRUPT, NULL, NULL))
 		sb_ebort("ISE: PTRACE_INTERRUPT failed: %s\n", strerror(errno));
 
-	trace_loop(mypipe);
+	trace_loop();
+
+	/* tracee blocks until we close this */
+	close(mypipe);
+
+	for (;;)
+		trace_loop();
+
 	sb_ebort("ISE: traced process should have quit, as should we\n");
 }
 
